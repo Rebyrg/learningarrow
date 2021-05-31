@@ -15,25 +15,44 @@ enum class CalculationMode { STANDARD, EXPERT }
 data class DynamicUserSelection(override val industry: String, val mode: CalculationMode, val eventsSelection: List<EventSelection>): UserSelection(industry)
 data class FixedUserSelection(override val industry: String, val fixedId: FixedId): UserSelection(industry)
 
+interface RootAggregate<I> {
+    val id: I
+}
+
 typealias FixedId = Long
-data class Fixed(val id: FixedId, val events: List<Event>)
+data class Fixed(override val id: FixedId, val events: List<Event>): RootAggregate<FixedId>
 data class EventConstraint(val id: EventId, val min: Double, val max: Double)
 data class CalculationConstant(val id: EventId, val factor: Double)
 data class BenefitTemplate(val id: BenefitId, val name: String, val events: Set<EventId>)
 
 typealias CalculationNumber = Long
-data class Draft(val id: CalculationNumber, val selection: UserSelection)
-data class Final(val id: CalculationNumber, val draftId: CalculationNumber, val events: List<Event>)
+data class Draft(override val id: CalculationNumber, val selection: UserSelection): RootAggregate<CalculationNumber>
+data class Final(override val id: CalculationNumber, val draftId: CalculationNumber, val events: List<Event>): RootAggregate<CalculationNumber>
 
-//zaleznosci
+typealias VersionId = Int
+sealed class VersionRange {
+    abstract fun match(versionId: VersionId): Boolean
+    object All: VersionRange() {
+        override fun match(versionId: VersionId): Boolean = true
+    }
+    data class From(val from: VersionId): VersionRange() {
+        override fun match(versionId: VersionId): Boolean = versionId >= from
+    }
+    data class To(val to: VersionId): VersionRange() {
+        override fun match(versionId: VersionId): Boolean = versionId <= to
+    }
+    data class Range(val from: VersionId, val to: VersionId): VersionRange() {
+        override fun match(versionId: VersionId): Boolean = versionId in from .. to
+    }
+}
+
 //1. repozytoria to interfejsy, ktore w adapterach sa podpinane do repozytoriow JPA
 interface Repository<I, V> {
     fun findById(id: I): V?
 }
 //2. definicje to obiekty i wartosci ktore teraz mamy rozproszone po roznych val, object, companion object
-//fajnie byloby to wersjonowac i api z podaniem wersji
 interface Definition<D> {
-    fun get(): D?
+    fun get(versionId: VersionId): D?
 }
 //3. Domyslne wartosc ? //TODO
 //4. Generatory identyfikatorow
@@ -41,6 +60,15 @@ interface IdGenerator<out I> {
     fun next(): I
 }
 //5. Feigny //todo
+//6. Wersjonowanie
+interface Versioned<out T> {
+    fun get(versionId: VersionId): T?
+}
+
+data class VersionedValues<T>(private val values: Map<VersionRange, T>): Versioned<T> {
+    override fun get(versionId: VersionId): T? =
+        values.entries.firstOrNull { it.key.match(versionId) }?.value
+}
 interface CalculationNumberGenerator: IdGenerator<CalculationNumber>
 interface DraftRepository: Repository<CalculationNumber, Draft>
 interface FinalRepository: Repository<CalculationNumber, Final>
@@ -50,6 +78,9 @@ interface CalculationConstantsDefinition: Definition<List<CalculationConstant>>
 interface BenefitsDefinition: Definition<List<BenefitTemplate>>
 
 //interfejsy uzywajace zaleznosci na potrzeby DI
+interface VersionedDependency {
+    fun version(): VersionId
+}
 interface CalculationNumberGeneratorDependency {
     val calculationNumberGenerator: CalculationNumberGenerator
 }
@@ -78,17 +109,18 @@ typealias AlgebraError = String
 typealias AlgebraEither<T> = Either<AlgebraError, T>
 
 //pomocnicze metody operujace na repozytoriach, definicjach itp.
+typealias BaseAlgebraDependency = VersionedDependency
+
 interface BaseAlgebra {
     fun <E> mandatory(getter: () -> E?, onError: (() -> AlgebraError) = { "expected value" }): AlgebraEither<E> =
         getter()?.right() ?: onError().left()
 
-    fun <T, D: Definition<T>> mandatoryDefinition(definition: D): AlgebraEither<T> =
-        mandatory(definition::get) { "nod definition available" }
-
+    fun <T, D: Definition<T>> BaseAlgebraDependency.mandatoryDefinition(definition: D): AlgebraEither<T> =
+        mandatory({ definition.get(version()) }, { "nod definition available" } )
 }
 
 //compute draft
-interface ComputeDraftAlgebraDependency: DraftRepositoryDependency
+interface ComputeDraftAlgebraDependency: BaseAlgebraDependency, DraftRepositoryDependency
 
 interface ComputeDraftAlgebra: BaseAlgebra {
 
@@ -104,17 +136,26 @@ interface ComputeDraftAlgebra: BaseAlgebra {
 }
 
 //edit: industry
-typealias EditIndustryAlgebraDependency = ComputeDraftAlgebraDependency
+interface EditIndustryAlgebraDependency: ComputeDynamicAlgebraDependency
 
-interface EditIndustryAlgebra: ComputeDraftAlgebra {
+interface EditIndustryAlgebra: ComputeDynamicAlgebra {
 
     fun EditIndustryAlgebraDependency.changeIndustry(id: CalculationNumber, industry: String): AlgebraEither<Draft> =
-        edit(id) { selection ->
-            when (selection) {
-                is FixedUserSelection -> selection.copy(industry = industry)
-                is DynamicUserSelection -> selection.copy(industry = industry) //tu mozemy dodac np. kompensacje
-            }.right()
+        edit(id) { selection -> changeIndustry(selection, industry) }
+
+    //logike nie piszemy w encjach tylko w algebrach
+    private fun EditIndustryAlgebraDependency.changeIndustry(selection: UserSelection, industry: String): AlgebraEither<UserSelection> =
+        when (selection) {
+            is FixedUserSelection -> changeFixedIndustry(selection, industry)
+            is DynamicUserSelection -> changeDynamicIndustry(selection, industry)
         }
+
+    private fun EditIndustryAlgebraDependency.changeFixedIndustry(selection: FixedUserSelection, industry: String): AlgebraEither<UserSelection> =
+        selection.copy(industry = industry).right()
+
+    private fun EditIndustryAlgebraDependency.changeDynamicIndustry(selection: DynamicUserSelection, industry: String): AlgebraEither<UserSelection> =
+        compensate(selection.copy(industry = industry))
+
 }
 
 //compute events definition
@@ -193,8 +234,7 @@ interface CreateDynamicAlgebra: ComputeDynamicAlgebra {
 
     fun CreateDynamicAlgebraDependencies.createDynamic(needs: Set<EventId>): AlgebraEither<Draft> =
         either.eager {
-            val definitionEither = eventsDefinition.get()?.right() ?: "no events definition".left()
-            val definition = definitionEither.bind()
+            val definition = mandatoryDefinition(eventsDefinition).bind()
             val mode = CalculationMode.STANDARD
             val eventsEither = definition[mode]?.right() ?: "no events definition for mode $mode".left()
             val events = eventsEither.bind()
@@ -245,7 +285,7 @@ interface DraftEventsAlgebra: ComputeDraftAlgebra, ComputeDynamicAlgebra, Comput
 }
 
 //benefits
-typealias BenefitsAlgebraDependency = BenefitsDefinitionDependency
+interface BenefitsAlgebraDependency: BenefitsDefinitionDependency, BaseAlgebraDependency
 
 interface BenefitsAlgebra: BaseAlgebra {
 
@@ -268,11 +308,11 @@ interface DraftBenefitsAlgebra: DraftEventsAlgebra, BenefitsAlgebra {
 interface CreateFixedAlgebraDependency: FixedRepositoryDependency, CalculationNumberGeneratorDependency
 
 interface CreateFixedAlgebra: BaseAlgebra {
-    fun CreateFixedAlgebraDependency.createDynamic(fixedId: FixedId): AlgebraEither<Draft> =
+    fun CreateFixedAlgebraDependency.createFixed(fixedId: FixedId): AlgebraEither<Draft> =
         either.eager {
             mandatory( { fixedRepository.findById(fixedId) }, { "fixed definition for id $fixedId does not exists "} ).bind()
             val industry = "default industry"
-            val calculationId = this@createDynamic.calculationNumberGenerator.next()
+            val calculationId = this@createFixed.calculationNumberGenerator.next()
             Draft(calculationId, FixedUserSelection(industry, fixedId))
         }
 }
@@ -287,4 +327,43 @@ interface CommitAlgebra: DraftEventsAlgebra, CalculationNumberGenerator {
             val finalId = calculationNumberGenerator.next()
             Final(finalId, draft.id, events)
         }
+}
+
+///////////////////////////////////
+interface Store {
+    fun <I, T: RootAggregate<I>> save(entity: T): T
+}
+
+interface StoreDependency {
+    val store: Store
+}
+
+interface Command<in D, out R> {
+    fun D.execute(): AlgebraEither<R>
+    fun execute(): D.() -> AlgebraEither<R> = { this.execute() }
+}
+
+//przykladowe commandy
+interface  CreateFixedDraftDependency: StoreDependency, CreateFixedAlgebraDependency
+data class CreateFixedDraftCommand(val fixedId: FixedId): Command<CreateFixedDraftDependency, CalculationNumber>, CreateFixedAlgebra {
+    override fun CreateFixedDraftDependency.execute(): AlgebraEither<CalculationNumber> =
+        createFixed(fixedId).map { store.save(it).id }
+}
+
+interface EditIndustryCommandDependency: StoreDependency, EditIndustryAlgebraDependency
+data class EditIndustryCommand(val id: CalculationNumber, val industry: String): Command<EditIndustryCommandDependency, Unit>, EditIndustryAlgebra {
+    override fun EditIndustryCommandDependency.execute(): AlgebraEither<Unit> =
+        changeIndustry(id, industry).map { store.save(it) }
+}
+
+interface ApplicationDependencies: CreateFixedDraftDependency, EditIndustryCommandDependency //todo pozostale zaleznosci per command
+
+/*@Service*/
+data class Application(/*@Autowired*/val dependency: ApplicationDependencies) {
+
+    private fun <R> execute(command: Command<ApplicationDependencies, R>): AlgebraEither<R> =
+        command.execute()(dependency)
+
+    fun createFixed(fixedId: FixedId): AlgebraEither<CalculationNumber> = execute(CreateFixedDraftCommand(fixedId))
+    fun editIndustry(id: CalculationNumber, industry: String): AlgebraEither<Unit> = execute(EditIndustryCommand(id, industry))
 }
