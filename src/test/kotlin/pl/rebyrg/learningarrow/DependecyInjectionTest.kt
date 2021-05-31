@@ -356,7 +356,7 @@ data class EditIndustryCommand(val id: CalculationNumber, val industry: String):
         changeIndustry(id, industry).map { store.save(it) }
 }
 
-interface ApplicationDependencies: CreateFixedDraftDependency //todo pozostale zaleznosci per command
+interface ApplicationDependencies: CreateFixedDraftDependency, EditIndustryCommandDependency //todo pozostale zaleznosci per command
 
 /*@Service*/
 data class Application(/*@Autowired*/val dependency: ApplicationDependencies) {
@@ -365,4 +365,5 @@ data class Application(/*@Autowired*/val dependency: ApplicationDependencies) {
         command.execute()(dependency)
 
     fun createFixed(fixedId: FixedId): AlgebraEither<CalculationNumber> = execute(CreateFixedDraftCommand(fixedId))
+    fun editIndustry(id: CalculationNumber, industry: String): AlgebraEither<Unit> = execute(EditIndustryCommand(id, industry))
 }
